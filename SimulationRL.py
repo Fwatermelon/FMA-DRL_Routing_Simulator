@@ -18,7 +18,6 @@ from datetime import datetime
 import seaborn as sns
 import gc
 import cProfile
-import cProfile
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -40,6 +39,7 @@ class Logger(object):
         self.terminal = sys.stdout
         self.log = open(filename, 'a')
         atexit.register(self.close)  # Register the close method to be called when the program exits
+        #注册close方法，以便在程序退出时调用
 
     def write(self, message):
         self.terminal.write(message)
@@ -569,6 +569,7 @@ class Satellite:
     def createReceiveBlockProcess(self, block, propTime):
         """
         Function which starts a receiveBlock process upon receiving a block from a transmitter.
+        当从发送器接收到一个块时启动receiveBlock进程的函数。
         """
         process = self.env.process(self.receiveBlock(block, propTime))
 
@@ -580,13 +581,16 @@ class Satellite:
         of the propagation delay and adding the block to the send-buffer afterwards. Since there are multiple buffers,
         this function looks at the next step in the blocks path and adds the block to the correct send-buffer.
         When Q-Learning or Deep learning is used, this function is where the next step in the block's path is found.
-
+        此函数用于处理数据块的传播延迟。只需等待传播延迟的时间，然后将块添加到发送缓冲区即可完成此操作。由于存在多个缓冲区，因此该函数将查看块路径中的下一步，
+        并将块添加到正确的发送缓冲区中。当使用Q-Learning或深度学习时，该函数是找到块路径的下一个步骤的地方。
         While the transmission delay is handled at the transmitter, the transmitter cannot also wait for the propagation
         delay, otherwise the send-buffer might be overfilled.
-
+        在发送端处理传输延迟的同时，发送端也不能等待传播延迟，否则发送端缓冲区可能会被填满。
         Using this structure, if there are to be implemented limits on the sizes of the "receive-buffer" it could be
         handled by either limiting the amount of these processes that can occur at the same time, or limiting the size
         of the send-buffer.
+        使用此结构，如果要实现对“接收缓冲区”大小的限制，
+        则可以通过限制可以同时发生的这些进程的数量或限制发送缓冲区的大小来处理。
         """
         # wait for block to fully propagate
         self.tempBlocks.append(block)
@@ -1838,6 +1842,8 @@ class Earth:
         Function from the non-reinforcement implementation. However, due to the paths not existing between transmitter
         and destination gateways (they get created as the blocks travel through the constellation), this version does
         work with Q-Learning and Deep-Learning.
+        功能由非强化实现。然而，由于发射器和目的地网关之间不存在路径（它们是在块通过星座时创建的），
+        因此该版本确实适用于Q-Learning和深度学习。
 
         Can be used for a simpler version of updating the processes on satellites. However, it does not take into
         account that some processes may be able to continue without being stopped. Stopping the processes may lose
