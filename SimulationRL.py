@@ -105,9 +105,9 @@ w4          = 5         # Normalization for the distance reward, for the travele
 
 gamma       = 0.99       # greedy factor. Smaller -> Greedy. Optimized params: 0.6 for Q-Learning, 0.99 for Deep Q-Learning
 
-GTs = [2]               # number of gateways to be tested
+#GTs = [2]               # number of gateways to be tested
 # Gateways are taken from https://www.ksat.no/ground-network-services/the-ksat-global-ground-station-network/ (Except for Malaga and Aalborg)
-# GTs = [i for i in range(2,9)] # This is to make a sweep where scenarios with all the gateways in the range are considered
+GTs = [i for i in range(2,9)] # This is to make a sweep where scenarios with all the gateways in the range are considered
 
 # Physical constants
 rKM = 500               # radio in km of the coverage of each gateway
@@ -1721,7 +1721,9 @@ class Earth:
                         gtLongi = gateways['Longitude'][i]
                         self.gateways.append(Gateway(lName, i, gtLati, gtLongi, self.total_x, self.total_y,
                                                                    length, env, totalLocations, self))
+                        print(f"Activated gateway: {lName}")
                         break
+                    
         else:
             for i in range(len(gateways['Latitude'])):
                 name = gateways['Location'][i]
