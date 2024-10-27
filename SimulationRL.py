@@ -107,7 +107,7 @@ gamma       = 0.99       # greedy factor. Smaller -> Greedy. Optimized params: 0
 
 #GTs = [2]               # number of gateways to be tested
 # Gateways are taken from https://www.ksat.no/ground-network-services/the-ksat-global-ground-station-network/ (Except for Malaga and Aalborg)
-GTs = [i for i in range(2,9)] # This is to make a sweep where scenarios with all the gateways in the range are considered
+GTs = [i for i in range(4,9)] # This is to make a sweep where scenarios with all the gateways in the range are considered
 
 # Physical constants
 rKM = 500               # radio in km of the coverage of each gateway
@@ -224,7 +224,8 @@ tablesPath  = './pre_trained_NNs/qTablesExport_8GTs/'
 
 if __name__ == '__main__':
     # nnpath          = f'./pre_trained_NNs/qNetwork_8GTs.h5'
-    outputPath      = './Results/{}_{}s_[{}]_Del_[{}]_w1_[{}]_w2_{}_GTs/'.format(pathing, float(pd.read_csv("inputRL.csv")['Test length'][0]), ArriveReward, w1, w2, GTs)
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    outputPath = './Results/{}_{}s_[{}]_Del_[{}]_w1_[{}]_w2_{}_GTs_{}/'.format(pathing, float(pd.read_csv("inputRL.csv")['Test length'][0]), ArriveReward, w1, w2, GTs, current_time)
     populationMap   = 'Population Map/gpw_v4_population_count_rev11_2020_15_min.tif'
 
 ###############################################################################
@@ -3981,83 +3982,111 @@ class DDQNAgent:
         return model
 
     def train(self, sat, earth):
-        if self.experienceReplay.buffeSize < self.batchS*3:
+        if self.experienceReplay.buffeSize < self.batchS * 3:
             return -1
 
-        # 1. Get a random batch from the experience
+        # 1. 从经验回放池中获取一个批次
         miniBatch = self.experienceReplay.getBatch(self.batchS)
-        states, actions, rewards, nextStates, Dones = self.experienceReplay.getArraysFromBatch(miniBatch)
-        states      = states.reshape((self.batchS,self.stateSize))
-        nextStates  = nextStates.reshape((self.batchS,self.stateSize))
-         
-        # 2. Compute expected reward
+        if not miniBatch:
+            return
+
+        states, actions, rewards, nextStates, dones, weights, indices = miniBatch
+        states = states.reshape((self.batchS, self.stateSize))
+        nextStates = nextStates.reshape((self.batchS, self.stateSize))
+
+        # 2. 计算目标 Q 值
         if ddqn:
-            futureRewards = self.qTarget(nextStates)           # NOTE NN. Gets future rewards
+            futureRewards = self.qTarget(nextStates)  # 使用目标网络计算未来奖励
         else:
-            futureRewards = self.qNetwork(nextStates)          # NOTE NN. Gets future rewards
-        expectedRewards = rewards + self.gamma*np.max(futureRewards, axis=1)
+            futureRewards = self.qNetwork(nextStates)
 
-        # 3. Mask for the actions
+        expectedRewards = rewards + self.gamma * np.max(futureRewards, axis=1) * (1 - dones)
+
+        # 3. 使用权重来调整误差
         acts = np.eye(self.actionSize)[actions]
+        q_values = self.qNetwork(states).numpy()
+        td_errors = expectedRewards - np.sum(q_values * acts, axis=1)
 
-        # 4. Stop Loss
-        if stopLoss and len(sat.orbPlane.earth.loss)>nLosses:
-            savedLoss = sat.orbPlane.earth.loss
-            last_n_losses = [sample[0] for sample in savedLoss[-nLosses:]]
-            average = sum(last_n_losses) / nLosses 
-            sat.orbPlane.earth.lossAv.append(average)
-            if average < lThreshold:
-                global TrainThis
-                TrainThis = False
-                print('----------------------------------')
-                print(f"STOP LOSS ACTIVATED")
-                print(f'Last {nLosses} losses: {last_n_losses}')
-                print(f'Simulation time: {sat.env.now}')
-                print('----------------------------------')
-                return 0
-
-        # 5. fit the model and save the loss
-        loss = self.qNetwork.fit(states, acts * expectedRewards[:, None], batch_size=self.batchS, epochs=1, verbose=0) # NOTE qNetwork fit
+        # 4. 使用重要性采样权重来更新网络
+        loss = self.qNetwork.fit(states, acts * (td_errors[:, None] * weights[:, None]), batch_size=self.batchS, epochs=1, verbose=0)
         sat.orbPlane.earth.loss.append([loss.history['loss'][0], sat.env.now])
-        earth.trains.append([sat.env.now]) # counts the number of trainings
+        earth.trains.append([sat.env.now])
+
+        # 5. 更新经验的优先级
+        new_priorities = np.abs(td_errors) + 1e-6  # 防止优先级为0
+        self.experienceReplay.update_priorities(indices, new_priorities)
         
 
 # @profile
 class ExperienceReplay:
-    def __init__(self, maxlen = 100):
+    def __init__(self, maxlen=100, alpha=0.6, beta_start=0.4, beta_frames=1000):
         '''
+        扩展为包含优先经验回放机制 
         This is a buffer that holds information that are used during training process.
 
         Deque (Doubly Ended Queue). Deque is preferred over a list in the cases where we need quicker append and pop operations
         from both the ends of the container, as deque provides an O(1) time complexity for append and pop operations as compared
         to a list that provides O(n) time complexity
+
         '''
         self.buffer = deque(maxlen=maxlen)
+        self.priorities = deque(maxlen=maxlen)  # 存储优先级
+        self.alpha = alpha  # 用于调整采样的随机性和确定性程度
+        self.beta_start = beta_start  # 初始的 beta 值
+        self.beta_frames = beta_frames  # 用于逐渐增加 beta 值，使得训练趋向于更平稳
+        self.frame = 1  # 记录当前的 frame 数量
 
     def store(self, state, action, reward, nextState, terminated):
         '''
-        appends a set of (state, action, reward, next state, terminated) to the experience replay buffer
+        将经验存储到回放池，并分配初始优先级
         '''
-        # if the buffer is full, it behave as a FIFO
+        max_priority = max(self.priorities, default=1.0)
         self.buffer.append((state, action, reward, nextState, terminated))
+        self.priorities.append(max_priority)  # 新的经验初始优先级为最大值
 
     def getBatch(self, batchSize):
         '''
-        gets a random batch of samples from all the samples
+        通过优先级采样获取批次
         '''
-        return random.sample(self.buffer, batchSize)
+        if len(self.buffer) == 0:
+            return []
 
-    def getArraysFromBatch(self, batch):
+        # 计算采样权重
+        priorities = np.array(self.priorities)
+        probabilities = priorities ** self.alpha
+        probabilities /= probabilities.sum()
+
+        # 使用概率选择经验
+        indices = np.random.choice(len(self.buffer), batchSize, p=probabilities)
+        samples = [self.buffer[idx] for idx in indices]
+
+        # 计算重要性采样权重
+        beta = self.beta_start + self.frame * (1.0 - self.beta_start) / self.beta_frames
+        beta = min(1.0, beta)
+        weights = (len(self.buffer) * probabilities[indices]) ** (-beta)
+        weights /= weights.max()
+
+        # 更新 frame 计数
+        self.frame += 1
+
+        # 提取批次数据
+        states, actions, rewards, nextStates, dones = zip(*samples)
+        return (
+            np.array(states),
+            np.array(actions),
+            np.array(rewards),
+            np.array(nextStates),
+            np.array(dones),
+            np.array(weights),
+            indices
+        )
+
+    def update_priorities(self, batch_indices, batch_priorities):
         '''
-        gets the batch data divided into fields
+        更新采样的优先级
         '''
-        states  = np.array([x[0] for x in batch])
-        actions = np.array([x[1] for x in batch])
-        rewards = np.array([x[2] for x in batch])
-        next_st = np.array([x[3] for x in batch])
-        dones   = np.array([x[4] for x in batch])
-        
-        return states, actions, rewards, next_st, dones
+        for idx, priority in zip(batch_indices, batch_priorities):
+            self.priorities[idx] = priority
 
     @property
     def buffeSize(self):
