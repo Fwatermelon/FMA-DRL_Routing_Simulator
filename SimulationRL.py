@@ -18,8 +18,11 @@ from datetime import datetime
 import seaborn as sns
 import gc
 import cProfile
-from collections import defaultdict
-import glob
+import torch
+import torch.nn as nn
+import torch_geometric
+from torch_geometric.nn import GCNConv
+
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -41,6 +44,7 @@ class Logger(object):
         self.terminal = sys.stdout
         self.log = open(filename, 'a')
         atexit.register(self.close)  # Register the close method to be called when the program exits
+        #注册close方法，以便在程序退出时调用
 
     def write(self, message):
         self.terminal.write(message)
@@ -85,25 +89,20 @@ from collections import deque
 pathings    = ['hop', 'dataRate', 'dataRateOG', 'slant_range', 'Q-Learning', 'Deep Q-Learning']
 pathing     = pathings[5]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
 
-FL_Test     = True      # If True, it plots the model divergence the model divergence between agents
-saveISLs    = True     # save ISLs map
-plotSatID   = True     # If True, plots the ID of each satellite
-plotAllThro = True      # If True, it plots throughput plots for each single path between gateways. If False, it plots a single figure for overall Throughput
-plotAllCon  = True      # If True, it plots congestion maps for each single path between gateways. If False, it plots a single figure for overall congestion
+plotDeliver = False     # create pictures of the path every 1/10 times a data block gets its destination
+saveISLs    = False     # save ISLs map
 
-movementTime= 10.0#5     # Every movementTime seconds, the satellites positions are updated and the graph is built again
+movementTime= 2#0.05   # Every movementTime seconds, the satellites positions are updated and the graph is built again
                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
-ndeltas     = 5805.44/20#1 Movement speedup factor. Every movementTime sats will move movementTime*ndeltas space. If bigger, will make the rotation distance bigger
+ndeltas     = 5805.44/50#1 Movement speedup factor. This number will multiply deltaT. If bigger, will make the rotation distance bigger
 
-Train       = True      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
-explore     = False      # If True, makes random actions eventually, if false only exploitation
-importQVals = True     # imports either QTables or NN from a certain path
+Train       = False      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
+explore     = True      # If True, makes random actions eventually, if false only exploitation
+importQVals = False     # imports either QTables or NN from a certain path
 onlinePhase = False     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
 if onlinePhase:         # Just in case
     explore     = False
     importQVals = True
-else:
-    FL_Test = False
 
 w1          = 20        # rewards the getting to empty queues
 w2          = 20        # rewards getting closes phisycally   
@@ -111,9 +110,9 @@ w4          = 5         # Normalization for the distance reward, for the travele
 
 gamma       = 0.99       # greedy factor. Smaller -> Greedy. Optimized params: 0.6 for Q-Learning, 0.99 for Deep Q-Learning
 
-GTs = [5]               # number of gateways to be tested
+GTs = [2]               # number of gateways to be tested
 # Gateways are taken from https://www.ksat.no/ground-network-services/the-ksat-global-ground-station-network/ (Except for Malaga and Aalborg)
-# GTs = [i for i in range(2,9)] # This is to make a sweep where scenarios with all the gateways in the range are considered
+#GTs = [i for i in range(4,9)] # This is to make a sweep where scenarios with all the gateways in the range are considered
 
 # Physical constants
 rKM = 500               # radio in km of the coverage of each gateway
@@ -139,16 +138,15 @@ min_rate= 10e3  # Minimum rate in kbps
 # Uplink Parameters
 balancedFlow= False         # if set to true all the generated traffic at each GT is equal
 totalFlow   = 2*1000000000  # Total average flow per GT when the balanced traffc option is enabled. Malaga has 3*, LA has 3*, Nuuk/500
-avUserLoad  = 8593 * 8      # average traffic usage per second in bits
+avUserLoad  = 8593e-3      # average traffic usage per second in bits
 
 # Block
-BLOCK_SIZE   = 64800
+blockSize   = 64800
 
 # Movement and structure
 # movementTime= 0.05      # Every movementTime seconds, the satellites positions are updated and the graph is built again
 #                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
 # ndeltas     = 5805.44/20#1 Movement speedup factor. This number will multiply deltaT. If bigger, will make the rotation distance bigger
-const_moved = False     # Movement flag. If up, it means it has moved
 matching    = 'Greedy'  # ['Markovian', 'Greedy']
 minElAngle  = 30        # For satellites. Value is taken from NGSO constellation design chapter.
 mixLocs     = False     # If true, every time we make a new simulation the locations are going to change their order of selection
@@ -158,6 +156,7 @@ rotateFirst = False     # If True, the constellation starts rotated by 1 movemen
 coordGran   = 20            # Granularity of the coordinates that will be the input of the DNN: (Lat/coordGran, Lon/coordGran)
 diff        = True          # If up, the state space gives no coordinates about the neighbor and destination positions but the difference with respect to the current positions
 reducedState= False         # if set to true the DNN will receive as input only the positional information, but not the queueing information
+getDeepState = False
 notAvail    = 0             # this value is set in the state space when the satellite neighbour is not available
 
 # Learning Hyperparameters
@@ -170,8 +169,8 @@ alpha_dnn   = 0.01      # learning rate for the deep neural networks
 epsilon     = 0.1       # exploration factor for Q-Learning ONLY
 tau         = 0.1       # rate of copying the weights from the Q-Network to the target network
 learningRate= 0.001     # Default learning rate for Adam optimizer
-plotDeliver = False     # create pictures of the path every 1/10 times a data block gets its destination
-# plotSatID   = False     # If True, plots the ID of each satellite
+# plotDeliver = True      # create pictures of the path every 1/10 times a data block gets its destination
+plotSatID   = False     # If True, plots the ID of each satellite
 GridSize    = 8         # Earth divided in GridSize rows for the grid. Used to be 15
 winSize     = 20        # window size for the representation in the plots
 markerSize  = 50        # Size of the markers in the plots
@@ -179,7 +178,7 @@ nTrain      = 2         # The DNN will train every nTrain steps
 noPingPong  = True      # when a neighbour is the destination satellite, send there directly without going through the dnn (Change policy)
 
 # Queues & State
-infQueue    = 5000      # Upper boundary from where a queue is considered as infinite when obserbing the state
+infQueue    = 500      # Upper boundary from where a queue is considered as infinite when obserbing the state
 queueVals   = 10        # Values that the observed Queue can have, being 0 the best (Queue of 0) and max the worst (Huge queue or inexistent link).
 latBias     = 90        # This value is added to the latitude of each position in the state space. This can be done to avoid negative numbers
 lonBias     = 180       # Same but with longitude
@@ -225,17 +224,14 @@ CurrentGTnumber = -1    # Number of active gateways. This number will be updated
 ###############################      Paths      ###############################
 ###############################################################################
 
-# nnpath      = './pre_trained_NNs/qNetwork_8GTs_6secs_nocon.h5'
-# nnpathTarget= './pre_trained_NNs/qTarget_8GTs_6secs_nocon.h5'
-nnpath      = './pre_trained_NNs/qNetwork_3GTs.h5'
-nnpathTarget= './pre_trained_NNs/qTarget_3GTs.h5'
-# nnpath      = './pre_trained_NNs/qNetwork_2GTs.h5'
-# nnpathTarget= './pre_trained_NNs/qTarget_2GTs.h5'
+nnpath      = './pre_trained_NNs/qNetwork_8GTs_6secs_nocon.h5'
+nnpathTarget= './pre_trained_NNs/qTarget_8GTs_6secs_nocon.h5'
 tablesPath  = './pre_trained_NNs/qTablesExport_8GTs/'
 
 if __name__ == '__main__':
     # nnpath          = f'./pre_trained_NNs/qNetwork_8GTs.h5'
-    outputPath      = './Results/{}_{}s_[{}]_Del_[{}]_w1_[{}]_w2_{}_GTs/'.format(pathing, float(pd.read_csv("inputRL.csv")['Test length'][0]), ArriveReward, w1, w2, GTs)
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    outputPath = './Results/{}_{}s_[{}]_Del_[{}]_w1_[{}]_w2_{}_GTs_{}/'.format(pathing, float(pd.read_csv("inputRL.csv")['Test length'][0]), ArriveReward, w1, w2, GTs, current_time)
     populationMap   = 'Population Map/gpw_v4_population_count_rev11_2020_15_min.tif'
 
 ###############################################################################
@@ -271,9 +267,9 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
     earth.pathParam
 
     for block in receivedDataBlocks:
+        blocks.append(BlocksForPickle(block))
         time = block.getTotalTransmissionTime()
         hops = len(block.checkPoints)
-        blocks.append(BlocksForPickle(block))
 
         if largestTransmissionTime[0] < time:
             largestTransmissionTime = (time, block)
@@ -348,308 +344,6 @@ def simProgress(simTimelimit, env):
 
 
 ###############################################################################
-############################# Federated Learning ##############################
-###############################################################################
-
-FL_techs    = ['nothing', 'modelAnticipation', 'plane', 'full', 'combination']
-FL_tech     = FL_techs[3]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
-
-if pathing != 'Deep Q-Learning':
-    FL_Test = False
-
-if FL_Test:
-    CKA_Values = []     # CKA matrix 
-    num_samples = 10   # number of random samples to test the divergence between models
-    print(f'Federated Learning ongoing: {FL_tech}. Number of random samples to test divergence: {num_samples}')
-
-def generate_test_data(num_samples, include_not_avail=False):
-    data = []
-    queue_values = np.arange(0, 11)  # Possible queue values from 0 to 10
-    # Set probabilities: 0 at 35%, 10 at 20%, and 5% each for values 1-9
-    queue_probs = [0.35] + [0.05] * 9 + [0.20]
-
-    for _ in range(num_samples):
-        sample = []
-        # Queue Scores for each direction: Up, Down, Right, Left (4 scores each)
-        for _ in range(4):
-            # Queue scores biased towards 0 and 10
-            sample.extend(np.random.choice(queue_values, 4, p=queue_probs))
-            
-            # Relative positions for each direction: latitude and longitude
-            sample.append(np.random.uniform(-2, 2))  # Latitude relative position
-            sample.append(np.random.uniform(-2, 2))  # Longitude relative position
-        
-        # Absolute positions
-        sample.append(np.random.uniform(0, 9))  # Absolute latitude normalized
-        sample.append(np.random.uniform(0, 18))  # Absolute longitude normalized
-        
-        # Destination differential coordinates
-        sample.append(np.random.uniform(-2, 2))  # Destination differential latitude
-        sample.append(np.random.uniform(-2, 2))  # Destination differential longitude
-        
-        # Optionally include not available values
-        if include_not_avail and np.random.rand() < 0.1:  # 10% chance to introduce a -1 value
-            idx_to_replace = np.random.choice(len(sample), int(0.1 * len(sample)), replace=False)
-            sample[idx_to_replace] = -1
-        
-        data.append(sample)
-    
-    return np.array(data)
-
-def get_models(earth):
-    models = []
-    model_names = []
-    for plane in earth.LEO:
-        for sat in plane.sats:
-            models.append(sat.DDQNA.qNetwork)
-            model_names.append(sat.ID)
-    return models, model_names
-
-def average_model_weights(models):
-    """Average weights of multiple trained models."""
-    weights = [model.get_weights() for model in models]
-    new_weights = [np.mean(np.array(w), axis=0) for w in zip(*weights)]
-    return new_weights
-
-def full_federated_learning(models):
-    averaged_weights = average_model_weights(models)
-    for model in models:
-        model.set_weights(averaged_weights)
-
-def federate_by_plane(models, model_names):
-    """Perform Federated Averaging within each orbital plane."""
-    plane_dict = {}
-    for model, name in zip(models, model_names):
-        plane = name.split('_')[0]
-        if plane in plane_dict:
-            plane_dict[plane].append(model)
-        else:
-            plane_dict[plane] = [model]
-    for plane_models in plane_dict.values():
-        averaged_weights = average_model_weights(plane_models)
-        for model in plane_models:
-            model.set_weights(averaged_weights)
-
-def model_anticipation_federate(models, model_names):
-    """Perform Model Anticipation Federated Learning."""
-    plane_dict = {}
-    # Group models by orbital plane
-    for model, name in zip(models, model_names):
-        plane = name.split('_')[0]
-        if plane not in plane_dict:
-            plane_dict[plane] = []
-        plane_dict[plane].append((model, name))
-    
-    # Process each plane for model anticipation
-    for plane_models in plane_dict.values():
-        # Sort models by their identifiers within the plane
-        plane_models.sort(key=lambda x: int(x[1].split('_')[1]))
-        for i in range(1, len(plane_models)):
-            prev_model_weights = plane_models[i - 1][0].get_weights()
-            current_model = plane_models[i][0]
-            current_weights = current_model.get_weights()
-            # Average weights from the previous model
-            new_weights = [(w1 + w2) / 2 for w1, w2 in zip(current_weights, prev_model_weights)]
-            current_model.set_weights(new_weights)
-
-def update_sats_models(earth, models, model_names):
-    '''Update each satellite model for the updated one'''
-    print('Updating satellites models...')
-    for model, satID in zip(models, model_names):
-        sat = findByID(earth, satID)
-        sat.DDQNA.qNetwork = model
-        if ddqn:
-            sat.DDQNA.qTarget = model
-
-def compute_full_cka_matrix(models, data):
-    """Compute the full CKA matrix for a list of models."""
-    
-    def gram_matrix(X):
-        """Calculate the Gram matrix from layer activations."""
-        n = X.shape[0]
-        X = X - X.mean(axis=0)
-        return X @ X.T / n
-
-    def cka(G, H):
-        """Compute the CKA metric."""
-        return np.trace(G @ H) / np.sqrt(np.trace(G @ G) * np.trace(H @ H))
-
-    def compute_cka(model1, model2, data):
-        """Compute the CKA between layers of two models using data."""
-        intermediate_model1 = tf.keras.Model(inputs=model1.input, outputs=[layer.output for layer in model1.layers])
-        intermediate_model2 = tf.keras.Model(inputs=model2.input, outputs=[layer.output for layer in model2.layers])
-        activations1 = intermediate_model1(data)
-        activations2 = intermediate_model2(data)
-        return np.mean([cka(gram_matrix(np.array(act1)), gram_matrix(np.array(act2))) for act1, act2 in zip(activations1, activations2)])
-    
-    n = len(models)
-    cka_matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i, n):
-            if i == j:
-                cka_matrix[i, j] = 1.0
-            else:
-                cka_matrix[i, j] = cka_matrix[j, i] = compute_cka(models[i], models[j], data)
-    return cka_matrix
-
-def compute_average_cka(cka_matrix):
-    """Compute the average CKA value from a CKA matrix."""
-    triu_indices = np.triu_indices_from(cka_matrix, k=1)
-    return np.mean(cka_matrix[triu_indices])
-
-def perform_FL(earth):#, outputPath):
-
-    # path = outputPath + 'FL' + str(len(earth.gateways)) + 'GTs/'
-    # os.makedirs(path, exist_ok=True) 
-    print('----------------------------------')
-    print(f'Federated Learning. Performing: {FL_tech}')
-
-    data = generate_test_data(num_samples, include_not_avail=False)
-    models, model_names = get_models(earth)
-
-    CKA_Values_before = compute_full_cka_matrix(models, data)
-
-    if FL_tech == 'nothing':
-        return CKA_Values_before, CKA_Values_before
-        
-    if FL_tech == 'modelAnticipation':
-        model_anticipation_federate(models, model_names)
-    elif FL_tech == 'plane':
-        federate_by_plane(models, model_names)
-    elif FL_tech == 'full':
-        full_federated_learning(models)
-    elif FL_tech == 'combination':
-        pass
-
-    CKA_Values_after = compute_full_cka_matrix(models, data)
-    update_sats_models(earth, models, model_names)
-
-    print('----------------------------------')
-    return CKA_Values_before, CKA_Values_after
-
-def plot_cka_over_time_v0(cka_data, outputPath, nGTs):
-    """
-    Plots each CKA value over time in milliseconds, connecting 'before' and 'after' points with a line
-    and using different colors for each type of dot.
-    
-    Parameters:
-    - cka_data: List of [CKA_before, CKA_after, timestamp] entries.
-    """
-    path = outputPath + 'FL/'
-    os.makedirs(path, exist_ok=True) # create output path
-
-    # Extract times and CKA values for before and after
-    times = [entry[2] * 1000 for entry in cka_data]  # Convert time to milliseconds
-    cka_before_values = [compute_average_cka(entry[0]) for entry in cka_data]
-    cka_after_values = [compute_average_cka(entry[1]) for entry in cka_data]
-
-    # Construct the sequence for line plot: interleave before and after values
-    line_times = [time for time in times for _ in (0, 1)]
-    line_values = [val for pair in zip(cka_before_values, cka_after_values) for val in pair]
-
-    # Plotting
-    plt.figure(figsize=(10, 6))
-
-    # Line connecting all CKA values
-    plt.plot(line_times, line_values, label='CKA Value Sequence', color='gray', linestyle='--', alpha=0.7)
-
-    # Dots for 'CKA Before FL' and 'CKA After FL'
-    plt.scatter(times, cka_before_values, label='CKA Before FL', color='blue', marker='o')
-    plt.scatter(times, cka_after_values, label='CKA After FL', color='green', marker='s')
-
-    # Labels and title
-    plt.xlabel('Time (ms)')
-    plt.ylabel('CKA Value')
-    plt.title('CKA Values Over Time (ms) with Sequential Connection and Dot Types')
-    plt.legend()
-    plt.grid(True)
-    # plt.show()
-    plt.tight_layout()
-    plt.savefig(path + f'CKA_over_time_{str(nGTs)}_GTs', dpi=300, bbox_inches='tight')   
-
-    # Save mean CKA values over time
-    mean_cka_values = np.column_stack((times, cka_before_values, cka_after_values))
-    np.savetxt(os.path.join(path, 'mean_cka_values.csv'), mean_cka_values, delimiter=',', 
-               header="Time_ms,CKA_Before,CKA_After", comments='')
-
-    # Save individual CKA matrices before and after FL for each timestamp
-    for i, entry in enumerate(cka_data):
-        np.savetxt(os.path.join(path, f'cka_matrix_before_{i}.csv'), entry[0], delimiter=',')
-        np.savetxt(os.path.join(path, f'cka_matrix_after_{i}.csv'), entry[1], delimiter=',')
-
-def plot_cka_over_time(cka_data, outputPath, nGTs):
-    """
-    Plots each CKA value over time in milliseconds, connecting 'before' and 'after' points with a dashed line
-    and using different colors for each type of dot, with quartile ranges represented by error bars.
-    
-    Parameters:
-    - cka_data: List of [CKA_before, CKA_after, timestamp] entries.
-    """
-    path = outputPath + 'FL/'
-    os.makedirs(path, exist_ok=True)  # create output path
-
-    # Extract times and calculate CKA values for before and after
-    times = [entry[2] * 1000 for entry in cka_data]  # Convert time to milliseconds
-    cka_before_values = [np.mean(entry[0]) for entry in cka_data]
-    cka_after_values = [np.mean(entry[1]) for entry in cka_data]
-
-    # Calculate quartile ranges for before and after values
-    cka_before_quartiles = [np.percentile(entry[0], [25, 75]) for entry in cka_data]
-    cka_after_quartiles = [np.percentile(entry[1], [25, 75]) for entry in cka_data]
-    cka_before_25th, cka_before_75th = zip(*cka_before_quartiles)
-    cka_after_25th, cka_after_75th = zip(*cka_after_quartiles)
-
-    # Construct the sequence for line plot: interleave before and after mean values
-    line_times = [time for time in times for _ in (0, 1)]
-    line_values = [val for pair in zip(cka_before_values, cka_after_values) for val in pair]
-
-    # Set y-axis limits with margin to avoid cutting T-caps and ensure the max is exactly 1
-    y_min = min(min(cka_before_25th), min(cka_after_25th)) * 0.95
-    y_max = 1
-
-    # Plotting
-    plt.figure(figsize=(10, 6))
-
-    # Line connecting mean CKA values
-    plt.plot(line_times, line_values, label='CKA Value Sequence', color='gray', linestyle='-.', alpha=0.7)
-
-    # Error bars for 'CKA Before FL' and 'CKA After FL' with T-caps
-    cka_before_yerr = [np.abs(np.subtract(cka_before_values, cka_before_25th)), 
-                       np.abs(np.subtract(cka_before_75th, cka_before_values))]
-    cka_after_yerr = [np.abs(np.subtract(cka_after_values, cka_after_25th)), 
-                      np.abs(np.subtract(cka_after_75th, cka_after_values))]
-
-    plt.errorbar(times, cka_before_values, yerr=cka_before_yerr, fmt='s', color='blue', 
-                 ecolor='blue', capsize=8, capthick=2, label='CKA Before FL Quartiles')
-    plt.errorbar(times, cka_after_values, yerr=cka_after_yerr, fmt='s', color='green', 
-                 ecolor='green', capsize=8, capthick=2, label='CKA After FL Quartiles')
-
-    # Set x-axis and y-axis limits with a dynamic y-axis minimum
-    plt.xlim(min(times) - 20, max(times) + 20)
-    plt.ylim(y_min, y_max)
-    plt.ticklabel_format(style='plain', axis='y')  # Disable scientific notation for y-axis
-
-    # Labels and title
-    plt.xlabel('Time (ms)')
-    plt.ylabel('CKA Value')
-    plt.title('CKA Values Over Time (ms)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, f'CKA_over_time_{str(nGTs)}_GTs.png'), dpi=300, bbox_inches='tight')
-
-    # Save mean CKA values over time
-    mean_cka_values = np.column_stack((times, cka_before_values, cka_after_values))
-    np.savetxt(os.path.join(path, 'mean_cka_values.csv'), mean_cka_values, delimiter=',', 
-               header="Time_ms,CKA_Before,CKA_After", comments='')
-
-    # Save individual CKA matrices before and after FL for each timestamp
-    for i, entry in enumerate(cka_data):
-        np.savetxt(os.path.join(path, f'cka_matrix_before_{i}.csv'), entry[0], delimiter=',')
-        np.savetxt(os.path.join(path, f'cka_matrix_after_{i}.csv'), entry[1], delimiter=',')
-
-
-###############################################################################
 ###############################     Classes    ################################
 ###############################################################################
 
@@ -671,7 +365,7 @@ class Results:
 
 class BlocksForPickle:
     def __init__(self, block):
-        self.size = BLOCK_SIZE  # size in bits
+        self.size = blockSize  # size in bits
         self.ID = block.ID  # a string which holds the source id, destination id, and index of the block, e.g. "1_2_12"
         self.timeAtFull = block.timeAtFull  # the simulation time at which the block was full and was ready to be sent.
         self.creationTime = block.creationTime  # the simulation time at which the block was created.
@@ -882,25 +576,12 @@ class Satellite:
     def createReceiveBlockProcess(self, block, propTime):
         """
         Function which starts a receiveBlock process upon receiving a block from a transmitter.
+        当从发送器接收到一个块时启动receiveBlock进程的函数。
         """
         process = self.env.process(self.receiveBlock(block, propTime))
 
     def receiveBlock(self, block, propTime):
-        """
-        Simpy process function:
 
-        This function is used to handle the propagation delay of data blocks. This is done simply by waiting the time
-        of the propagation delay and adding the block to the send-buffer afterwards. Since there are multiple buffers,
-        this function looks at the next step in the blocks path and adds the block to the correct send-buffer.
-        When Q-Learning or Deep learning is used, this function is where the next step in the block's path is found.
-
-        While the transmission delay is handled at the transmitter, the transmitter cannot also wait for the propagation
-        delay, otherwise the send-buffer might be overfilled.
-
-        Using this structure, if there are to be implemented limits on the sizes of the "receive-buffer" it could be
-        handled by either limiting the amount of these processes that can occur at the same time, or limiting the size
-        of the send-buffer.
-        """
         # wait for block to fully propagate
         self.tempBlocks.append(block)
 
@@ -924,11 +605,6 @@ class Satellite:
             pass
 
         block.checkPoints.append(self.env.now)
-
-        # if QLearning or Deep Q-Learning we:
-        # Compute the next hop in the path and add it to the second last position (Last is the destination gateway)
-        # we let the (Deep) Q-model choose the next hop and it will be added to the block.QPath as mentioned
-        # if the next hop is the linked gateway it will simply not add anything and will let the model work normally
         if ((self.QLearning) or (self.orbPlane.earth.DDQNA is not None) or (self.DDQNA is not None)):
             if len(block.QPath) > 3: # the block does not come from a gateway
                 if self.QLearning:
@@ -1155,6 +831,7 @@ class Satellite:
 
         feasible_speffs = speff_thresholds[np.nonzero(lin_thresholds <= snr)]
         speff = self.ngeo2gt.B * feasible_speffs[-1]
+        # speff = 5e9
 
         self.downRate = speff
 
@@ -1271,7 +948,7 @@ class DataBlock:
     """
 
     def __init__(self, source, destination, ID, creationTime):
-        self.size = BLOCK_SIZE  # size in bits
+        self.size = blockSize  # size in bits
         self.destination = destination
         self.source = source
         self.ID = ID            # a string which holds the source id, destination id, and index of the block, e.g. "1_2_12"
@@ -1380,7 +1057,7 @@ class Gateway:
         self.dataRate = None
         self.gs2ngeo = RFlink(
             frequency=30e9,
-            bandwidth=500e6,
+            bandwidth=20e6,
             maxPtx=20,
             aDiameterTx=0.33,
             aDiameterRx=0.26,
@@ -1490,7 +1167,7 @@ class Gateway:
 
             # calculate propagation time and transmission time
             propTime = self.timeToSend(self.linkedSat)
-            timeToSend = BLOCK_SIZE/self.dataRate
+            timeToSend = blockSize/self.dataRate
 
             self.sendBuffer[1][0].timeAtFirstTransmission = self.env.now
             yield self.env.timeout(timeToSend)
@@ -1596,6 +1273,7 @@ class Gateway:
 
         feasible_speffs = speff_thresholds[np.nonzero(lin_thresholds <= snr)]
         speff = self.gs2ngeo.B*feasible_speffs[-1]
+        # speff = 5e9
 
         self.dataRate = speff
 
@@ -1897,7 +1575,7 @@ class Gateway:
 
 # A single cell on earth
 class Cell:
-    def __init__(self, total_x, total_y, cell_x, cell_y, users, Re=6378e3, f=20e9, bw=200e6, noise_power=1 / (1e11)):
+    def __init__(self, total_x, total_y, cell_x, cell_y, users, Re=6378e3, f=20e9, bw=2e6, noise_power=1 / (1e11)):
         # X and Y coordinates of the cell on the dataset map
         self.map_x = cell_x
         self.map_y = cell_y
@@ -1975,7 +1653,6 @@ class Earth:
         self.rewards= []    # set of rewards
         self.trains = []    # Set of times when a fit to any dnn has happened
         self.graph  = None
-        self.CKA    = []
 
         pop_count_data = Image.open(img_path)
 
@@ -2031,7 +1708,9 @@ class Earth:
                         gtLongi = gateways['Longitude'][i]
                         self.gateways.append(Gateway(lName, i, gtLati, gtLongi, self.total_x, self.total_y,
                                                                    length, env, totalLocations, self))
+                        print(f"Activated gateway: {lName}")
                         break
+                    
         else:
             for i in range(len(gateways['Latitude'])):
                 name = gateways['Location'][i]
@@ -2152,6 +1831,8 @@ class Earth:
         Function from the non-reinforcement implementation. However, due to the paths not existing between transmitter
         and destination gateways (they get created as the blocks travel through the constellation), this version does
         work with Q-Learning and Deep-Learning.
+        功能由非强化实现。然而，由于发射器和目的地网关之间不存在路径（它们是在块通过星座时创建的），
+        因此该版本确实适用于Q-Learning和深度学习。
 
         Can be used for a simpler version of updating the processes on satellites. However, it does not take into
         account that some processes may be able to continue without being stopped. Stopping the processes may lose
@@ -3329,7 +3010,7 @@ class Earth:
                     interDataRates.append(satData[2])
         return interDataRates
 
-    def moveConstellation(self, env, deltaT=3600, getRates = False):
+    def moveConstellation(self, env, deltaT=36000, getRates = False):
         """
         Simpy process function:
 
@@ -3347,7 +3028,7 @@ class Earth:
             intraRate.append(self.LEO[0].sats[0].intraSats[0][2])
 
         while True:
-            print('Creating/Moving constellation: Updating satellites position and links.')
+            print('Moving constellation: Updating satellites position and links.')
             if getRates:
                 # get data rates for all inter plane ISLs and all GSLs (up and down) - used for testing
                 upDataRates, downDataRates = self.getGSLDataRates()
@@ -3396,12 +3077,6 @@ class Earth:
                 os.makedirs(islpath, exist_ok=True) 
                 self.plotMap(plotGT = True, plotSat = True, edges=True, save = True, outputPath=islpath, n=self.nMovs)
                 plt.close()
-
-            # Perform Federated Learning
-            if FL_Test:
-                const_moved = True
-                CKA_before, CKA_after = perform_FL(self)#, outputPath)
-                self.CKA.append([CKA_before, CKA_after, env.now])
 
     def testFlowConstraint1(self, graph):
         highestDist = (0,0)
@@ -3673,7 +3348,7 @@ class Earth:
         '''
         QTables initialization at each satellite
         '''
-        print('----------------------------------')
+        print('----------------------------')
 
         # path = './Results/Q-Learning/qTablesImport/qTablesExport/' + str(NGT) + 'GTs/'
         path = tablesPath
@@ -3698,7 +3373,7 @@ class Earth:
             print(str(i) + ' Q-Tables imported!')
         else:
             print(str(i) + ' Q-Tables created!')
-        print('----------------------------------')
+        print('----------------------------')
 
     def plot3D(self):
         fig = plt.figure()
@@ -3917,6 +3592,38 @@ class QLearning:
             self.nStates,
             self.qTable)
 
+##增加gcn
+class GCNLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(GCNLayer, self).__init__()
+        self.conv = GCNConv(in_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        # x: [num_nodes, num_features] -> 每个节点的特征
+        # edge_index: [2, num_edges] -> 边索引，表示节点之间的连接
+        print(f"x shape: {x.shape}, edge_index shape: {edge_index.shape}")
+        return self.conv(x, edge_index) # GCNConv返回更新后的节点特征
+    
+    
+class DDQNWithGCN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DDQNWithGCN, self).__init__()
+        self.gcn1 = GCNLayer(state_size, 128)  # 图卷积层1
+        self.gcn2 = GCNLayer(128, 64)         # 图卷积层2
+        self.fc1 = nn.Linear(64, 64)          # 全连接层1
+        self.fc2 = nn.Linear(64, action_size) # 输出层（预测Q值）
+
+    def forward(self, x, edge_index):
+         # x 是节点特征，edge_index 是边索引（卫星之间的连接）
+        x = self.gcn1(x, edge_index)  # 图卷积操作
+        x = torch.relu(x)
+        x = self.gcn2(x, edge_index)
+        x = torch.relu(x)
+        x = self.fc1(x)
+        x = torch.relu(x)
+        x = self.fc2(x)
+        return x
+
 
 # @profile
 class DDQNAgent:
@@ -3989,7 +3696,9 @@ class DDQNAgent:
                 print('----------------------------------')
                 print(f"Q-NETWORK created:")
                 print('----------------------------------')
-                self.qNetwork.summary()
+                # self.qNetwork.summary()
+                print(self.qNetwork)
+
             else:
                 print(f'Satellite {sat_ID} Q-Network initialized')
             if ddqn:
@@ -3998,7 +3707,9 @@ class DDQNAgent:
                     print('----------------------------------')
                     print("DDQN enabled, TARGET NETWORK created:")
                     print('----------------------------------')
-                    self.qTarget.summary()
+                    # self.qTarget.summary()
+                    print(self.qTarget)
+
                 else:
                     print(f'Satellite {sat_ID} Q-Target initialized')
         else:
@@ -4010,9 +3721,11 @@ class DDQNAgent:
                     print('----------------------------------')
                     print(f"Q-Network imported from:\n {nnpath}!!!")
                     print('----------------------------------')
-                    self.qNetwork.summary()
+                    # self.qNetwork.summary()
+                    print(self.qNetwork)
+
                 else:
-                    print(f'Satellite {sat_ID} Q-Network imported from:\n {nnpath}')
+                    print(f'Satellite {sat_ID} Q-Network imported')
                 
                 if ddqn:
                     global nnpathTarget
@@ -4025,7 +3738,7 @@ class DDQNAgent:
                         print('----------------------------------')
                     else:
                         # print(f'Satellite {sat_ID} Q-Target copied from Q-Network')
-                        print(f'Satellite {sat_ID} Q-Target Q-Target imported from:\n {nnpath}')
+                        print(f'Satellite {sat_ID} Q-Target Q-Target imported')
 
             except FileNotFoundError:
                 print('----------------------------------')
@@ -4037,14 +3750,22 @@ class DDQNAgent:
         Given a new observed state and the linkied satellites, it will return the next hop
         '''
         # randomly (Exploration)
-        if explore and random.uniform(0, 1)<self.alignEpsilon(self.step, sat):
+        node_features, edge_index = newState
+        if explore and random.uniform(0, 1) < self.alignEpsilon(self.step, sat):
             actIndex = random.randrange(self.actionSize)
-            action   = self.actions[actIndex]
-            while(linkedSats[action] == None):   # if that direction has no linked satellite
-                self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False) # stores experience, repeats randomly
+            action = self.actions[actIndex]
+            while linkedSats[action] is None:
+                self.experienceReplay.store(
+                node_features,
+                edge_index,
+                actIndex,
+                unavPenalty,
+                node_features,
+                edge_index
+            )
                 self.earth.rewards.append([unavPenalty, sat.env.now])
                 action = self.actions[random.randrange(len(self.actions))]
-
+                
         # highest value (Exploitation)
         else:
             if noPingPong: # No PING PONG: if one of the neighbours is the connected satellite then choose that one
@@ -4059,50 +3780,32 @@ class DDQNAgent:
                     actIndex = 3
 
                 if actIndex>-1:
-                    action      = self.actions[actIndex]
-                    destination = linkedSats[action]
-                    return [destination.ID, math.degrees(destination.longitude), math.degrees(destination.latitude)], actIndex
-                
-                # # Mapping from state indices to direction decisions
-                # decision_map = {
-                #     (4, 5): 0,    # Up
-                #     (10, 11): 1,  # Down
-                #     (16, 17): 2,  # Right
-                #     (22, 23): 3   # Left
-                # }
-                #     # Current satellite's destination position
-                # dest_lat = newState[0, 26]
-                # dest_lon = newState[0, 27]
+                    qValues = self.qNetwork(node_features, edge_index).detach().numpy()
+                    actIndex = np.argmax(qValues)
+                    action = self.actions[actIndex]
 
-                # # Iterate through the decision map and compare
-                # for (lat_idx, lon_idx), actIndex in decision_map.items():
-                #     if np.isclose(dest_lat, newState[0, lat_idx]) and np.isclose(dest_lon, newState[0, lon_idx]):
-                #         action      = self.actions[actIndex]
-                #         destination = linkedSats[action]
-                #         return [destination.ID, math.degrees(destination.longitude), math.degrees(destination.latitude)], actIndex
-
+               
             # Predict 
-            qValues = self.qNetwork(newState).numpy()               # NOTE NN. Gets next hop. state structure in debugging
+            qValues = self.qNetwork(node_features, edge_index).detach().numpy()
             actIndex = np.argmax(qValues)
-            action   = self.actions[actIndex]
+            action = self.actions[actIndex]
             while(linkedSats[action] == None):              # the chosen action has no linked satellite. NEGATIVE REWARD and store it, motherfucker.
             
             # while (linkedSats[action] is None or        # the chosen action has no linked satellite or the chosen satellite has been visited twice.
             # sum(linkedSats[action].ID == path[0] for path in block.QPath[:-1]) > 1):    
 
-                self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False) # from state to the same state, reward -1, not terminated
+                self.experienceReplay.store(
+                node_features,
+                edge_index,
+                actIndex,
+                unavPenalty,
+                node_features,
+                edge_index
+            )
                 self.earth.rewards.append([unavPenalty, sat.env.now])
-                qValues[0][actIndex] = -np.inf              # it will not be chosen again (as the model has still not trained with that)
-            
-            #     if np.all(qValues == -np.inf):              # all the neighbors have been visited twice
-            #         print(f'WARNING: All neighbors have been visited at least twice. A loop is going on in {sat.ID} with block: {block.ID}')
-            #         while (linkedSats[action] is None): # if all options were either not available or visited twice, then choose randomly an action that is available
-            #             np.random.randint(4)
-            #             actIndex = np.argmax(qValues)               # find again for the highest value
-            #             action   = self.actions[actIndex]  
-            #         break
-                actIndex = np.argmax(qValues)               # find again for the highest value
-                action   = self.actions[actIndex]  
+                qValues[0][actIndex] = -np.inf
+                actIndex = np.argmax(qValues)
+                action = self.actions[actIndex] 
 
         destination = linkedSats[action]    # Action is the keyword of the chosen linked satellite, linkedSats is a dictionary with 
                                             # each satellite associated to its corresponding keyword
@@ -4148,7 +3851,7 @@ class DDQNAgent:
         if reducedState:
             newState    = getDeepStateReduced(block, sat, linkedSats)
         elif diff:
-            newState    = getDeepStateDiff(block, sat, linkedSats) # This is the one being used by default
+             newState = getDeepStateDiff(block, sat, linkedSats)
         else:
             newState    = getDeepState(block, sat, linkedSats)
 
@@ -4165,16 +3868,43 @@ class DDQNAgent:
                 # distanceReward  = getDistanceRewardV4(prevSat, sat, block.destination, self.w2, self.w4)
                 queueReward     = getQueueReward   (block.queueTime[len(block.queueTime)-1], self.w1)
                 reward          = distanceReward + queueReward + ArriveReward
-                self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, True)
+                old_node_features, old_edge_index = block.oldState
+                new_node_features, new_edge_index = newState
+                self.experienceReplay.store(
+                    old_node_features,
+                    old_edge_index,
+                    block.oldAction,
+                    reward,
+                    new_node_features,
+                    new_edge_index
+                )
                 self.earth.rewards.append([reward, sat.env.now])
                 # self.experienceReplay.store(block.oldState, block.oldAction, ArriveReward, newState, True)
             elif distanceRew == 5:
                 distanceReward  = getDistanceRewardV5(prevSat, sat, self.w2)
                 reward          = distanceReward + ArriveReward
-                self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, True)
+                old_node_features, old_edge_index = block.oldState
+                new_node_features, new_edge_index = newState
+                self.experienceReplay.store(
+                    old_node_features,
+                    old_edge_index,
+                    block.oldAction,
+                    reward,
+                    new_node_features,
+                    new_edge_index
+                )
                 self.earth.rewards.append([reward, sat.env.now])
             else:
-                self.experienceReplay.store(block.oldState, block.oldAction, ArriveReward, newState, True)
+                old_node_features, old_edge_index = block.oldState
+                new_node_features, new_edge_index = newState
+                self.experienceReplay.store(
+                    old_node_features,
+                    old_edge_index,
+                    block.oldAction,
+                    reward,
+                    new_node_features,
+                    new_edge_index
+                )
                 self.earth.rewards.append([ArriveReward, sat.env.now])
 
             if TrainThis: self.train(sat, earth) # FIXME why here a train?? should not be here. Make a test without this when the model is stable
@@ -4219,7 +3949,16 @@ class DDQNAgent:
             reward          = distanceReward + again + queueReward
 
         # 5. Store the experience of previous Node (Agent, satellite) if it was not a gateway  
-            self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, False) # action index
+            old_node_features, old_edge_index = block.oldState
+            new_node_features, new_edge_index = newState
+            self.experienceReplay.store(
+                old_node_features,
+                old_edge_index,
+                block.oldAction,
+                reward,
+                new_node_features,
+                new_edge_index
+            )
             self.earth.rewards.append([reward, sat.env.now])
 
         # 6. Learning, train the Q-Network at every time we store experience
@@ -4283,96 +4022,137 @@ class DDQNAgent:
             self.qNetwork.trainable_variables): t.assign(t * (1 - self.tau) + e * self.tau)
 
     def createModel(self):
-        model = Sequential()
-        model.add(Dense(32, activation='relu', input_shape=(self.stateSize,), kernel_initializer='random_uniform'))
-        model.add(Dense(32, activation='relu', kernel_initializer='random_uniform'))
-        model.add(Dense(self.actionSize, activation='linear'))
-        # optimizer = Adam(learning_rate=alpha_dnn)
-        # model.compile(loss='mse', optimizer=optimizer)
-        model.compile(loss='mse', optimizer='adam')
-        return model
+        return DDQNWithGCN(state_size=self.stateSize, action_size=self.actionSize)
+
 
     def train(self, sat, earth):
-        if self.experienceReplay.buffeSize < self.batchS*3:
+        if self.experienceReplay.bufferSize < self.batchS * 3:
             return -1
 
-        # 1. Get a random batch from the experience
+        # 1. 从经验回放池中获取一个批次
         miniBatch = self.experienceReplay.getBatch(self.batchS)
-        states, actions, rewards, nextStates, Dones = self.experienceReplay.getArraysFromBatch(miniBatch)
-        states      = states.reshape((self.batchS,self.stateSize))
-        nextStates  = nextStates.reshape((self.batchS,self.stateSize))
-         
-        # 2. Compute expected reward
-        if ddqn:
-            futureRewards = self.qTarget(nextStates)           # NOTE NN. Gets future rewards
-        else:
-            futureRewards = self.qNetwork(nextStates)          # NOTE NN. Gets future rewards
-        expectedRewards = rewards + self.gamma*np.max(futureRewards, axis=1)
+        if not miniBatch:
+            return
 
-        # 3. Mask for the actions
-        acts = np.eye(self.actionSize)[actions]
+        node_features_batch, edge_indices_batch, actions, rewards, next_node_features_batch, next_edge_indices_batch, dones, weights, indices = miniBatch
 
-        # 4. Stop Loss
-        if stopLoss and len(sat.orbPlane.earth.loss)>nLosses:
-            savedLoss = sat.orbPlane.earth.loss
-            last_n_losses = [sample[0] for sample in savedLoss[-nLosses:]]
-            average = sum(last_n_losses) / nLosses 
-            sat.orbPlane.earth.lossAv.append(average)
-            if average < lThreshold:
-                global TrainThis
-                TrainThis = False
-                print('----------------------------------')
-                print(f"STOP LOSS ACTIVATED")
-                print(f'Last {nLosses} losses: {last_n_losses}')
-                print(f'Simulation time: {sat.env.now}')
-                print('----------------------------------')
-                return 0
+        # 存储每个样本的 TD-误差
+        td_errors_list = []
 
-        # 5. fit the model and save the loss
-        loss = self.qNetwork.fit(states, acts * expectedRewards[:, None], batch_size=self.batchS, epochs=1, verbose=0) # NOTE qNetwork fit
-        sat.orbPlane.earth.loss.append([loss.history['loss'][0], sat.env.now])
-        earth.trains.append([sat.env.now]) # counts the number of trainings
+        for i in range(len(node_features_batch)):
+            node_features = node_features_batch[i]
+            edge_index = edge_indices_batch[i]
+            next_node_features = next_node_features_batch[i]
+            next_edge_index = next_edge_indices_batch[i]
+
+            # 2. 计算当前 Q 值
+            current_q_values = self.qNetwork(node_features, edge_index).gather(1, torch.tensor(actions[i]).view(-1, 1))
+
+            # 3. 计算目标 Q 值
+            if ddqn:
+                # 使用在线网络选择动作，但用目标网络计算 Q 值
+                next_actions = torch.argmax(self.qNetwork(next_node_features, next_edge_index).detach(), dim=1)
+                next_q_values = self.qTarget(next_node_features, next_edge_index).gather(1, next_actions.view(-1, 1))
+            else:
+                next_q_values = self.qNetwork(next_node_features, next_edge_index).max(1)[0].view(-1, 1)
+
+            target_q_values = torch.tensor(rewards[i]) + self.gamma * next_q_values * (1 - torch.tensor(dones[i]))
+
+            # 4. 计算 TD-误差
+            td_errors = (target_q_values - current_q_values).detach().cpu().numpy()
+            td_errors_list.append(td_errors)
+
+            # 5. 计算加权损失
+            loss = (torch.tensor(weights[i]) * (current_q_values - target_q_values).pow(2)).mean()
+
+            # 反向传播和优化
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            earth.trains.append([sat.env.now])
+
+        # 6. 更新优先级
+        new_priorities = np.abs(td_errors_list) + 1e-6  # 避免优先级为 0
+        self.experienceReplay.update_priorities(indices, new_priorities.flatten())
+
         
 
 # @profile
 class ExperienceReplay:
-    def __init__(self, maxlen = 100):
+    def __init__(self, maxlen=100, alpha=0.6, beta_start=0.4, beta_frames=200):
         '''
+        扩展为包含优先经验回放机制 
         This is a buffer that holds information that are used during training process.
 
         Deque (Doubly Ended Queue). Deque is preferred over a list in the cases where we need quicker append and pop operations
         from both the ends of the container, as deque provides an O(1) time complexity for append and pop operations as compared
         to a list that provides O(n) time complexity
+
         '''
         self.buffer = deque(maxlen=maxlen)
+        self.priorities = deque(maxlen=maxlen)  # 存储优先级
+        self.alpha = alpha  # 用于调整采样的随机性和确定性程度
+        self.beta_start = beta_start  # 初始的 beta 值
+        self.beta_frames = beta_frames  # 用于逐渐增加 beta 值，使得训练趋向于更平稳
+        self.frame = 1  # 记录当前的 frame 数量
 
-    def store(self, state, action, reward, nextState, terminated):
+    def store(self, node_features, edge_index, action, reward, next_node_features, next_edge_index):
         '''
-        appends a set of (state, action, reward, next state, terminated) to the experience replay buffer
+        将经验存储到回放池，并分配初始优先级
         '''
-        # if the buffer is full, it behave as a FIFO
-        self.buffer.append((state, action, reward, nextState, terminated))
+        max_priority = max(self.priorities, default=1.0)
+        self.buffer.append((node_features, edge_index, action, reward, next_node_features, next_edge_index))
+        self.priorities.append(max_priority)  # 新的经验初始优先级为最大值
 
     def getBatch(self, batchSize):
         '''
-        gets a random batch of samples from all the samples
+        通过优先级采样获取批次
         '''
-        return random.sample(self.buffer, batchSize)
+        if len(self.buffer) == 0:
+            return []
 
-    def getArraysFromBatch(self, batch):
+        # 计算采样权重
+        priorities = np.array(self.priorities)
+        probabilities = priorities ** self.alpha
+        probabilities /= probabilities.sum()
+
+        # 使用概率选择经验
+        indices = np.random.choice(len(self.buffer), batchSize, p=probabilities)
+        samples = [self.buffer[idx] for idx in indices]
+
+        # 计算重要性采样权重
+        beta = self.beta_start + self.frame * (1.0 - self.beta_start) / self.beta_frames
+        beta = min(1.0, beta)
+        weights = (len(self.buffer) * probabilities[indices]) ** (-beta)
+        weights /= weights.max()
+
+        # 更新 frame 计数
+        self.frame += 1
+
+        # 提取批次数据
+        node_features, edge_indices, actions, rewards, next_node_features, next_edge_indices, dones = zip(*samples)
+        return (
+            [torch.tensor(f, dtype=torch.float32) for f in node_features],       # 节点特征
+            [torch.tensor(e, dtype=torch.long) for e in edge_indices],           # 边索引
+            np.array(actions),                                                  # 动作
+            np.array(rewards),                                                  # 奖励
+            [torch.tensor(f, dtype=torch.float32) for f in next_node_features],  # 下一状态节点特征
+            [torch.tensor(e, dtype=torch.long) for e in next_edge_indices],      # 下一状态边索引
+            np.array(dones),                                                    # 是否终止
+            np.array(weights),                                                  # 重要性采样权重
+            indices                                                             # 采样索引
+        )
+
+    def update_priorities(self, batch_indices, batch_priorities):
         '''
-        gets the batch data divided into fields
+        更新采样的优先级
         '''
-        states  = np.array([x[0] for x in batch])
-        actions = np.array([x[1] for x in batch])
-        rewards = np.array([x[2] for x in batch])
-        next_st = np.array([x[3] for x in batch])
-        dones   = np.array([x[4] for x in batch])
-        
-        return states, actions, rewards, next_st, dones
+        for idx, priority in zip(batch_indices, batch_priorities):
+            self.priorities[idx] = priority
 
     @property
-    def buffeSize(self):
+    def bufferSize(self):
         '''
         a pythonic way to use getters and setters in object-oriented programming
         this decorator is a built-in function that allows us to define methods that can be accessed like an attribute
@@ -4784,7 +4564,7 @@ def markovianMatchingTwo(earth):
 
     interISL = RFlink(
         frequency=26e9,
-        bandwidth=500e6,
+        bandwidth=5e6,
         maxPtx=10,
         aDiameterTx=0.26,
         aDiameterRx=0.26,
@@ -5527,22 +5307,6 @@ def getDeepLinkedSats(satA, g, earth):
     linkedSats['R'] = satA.right
     linkedSats['L'] = satA.left
 
-    # # Find inter-plane neighbours (right and left)
-    # for edge in list(g.edges(satA.ID)):
-    #     if edge[1][0].isdigit():
-    #         satB = findByID(earth, edge[1])
-    #         dir = getDirection(satA, satB)
-    #         if(dir == 3):                                         # Found Satellite at East
-    #             if linkedSats['R'] is not None:
-    #                 print(f"{satA.ID} east satellite duplicated! Replacing {linkedSats['R'].ID} with {satB.ID}")
-    #             linkedSats['R']  = satB
-
-    #         elif(dir == 4):                                       # Found Satellite at West
-    #             if linkedSats['L'] is not None:
-    #                 print(f"{satA.ID} west satellite duplicated! Replacing {linkedSats['L'].ID} with {satB.ID}")
-    #             linkedSats['L']  = satB
-    #     else:
-    #         pass
 
     return linkedSats
 
@@ -5605,13 +5369,14 @@ def getDeepStateReduced(block, sat, linkedSats):
                     getBiasedLongitude(satDest)]).reshape(1,-1)                 # Destination Longitude
 
 
+
+
 def getDeepStateDiff(block, sat, linkedSats):
     def normalize_angle_diff(angle_diff):
         # Ensure the angle difference is within [-180, 180]
         return (angle_diff + 180) % 360 - 180
 
     def get_relative_position(neighbor_sat, current_coord, is_lat=True):
-        # Convert and calculate relative position, considering the 180-degree discontinuity
         try:
             neighbor_coord = math.degrees(neighbor_sat.latitude if is_lat else neighbor_sat.longitude)
             current_coord = math.degrees(current_coord)
@@ -5619,16 +5384,16 @@ def getDeepStateDiff(block, sat, linkedSats):
             return diff / coordGran
         except AttributeError:
             return notAvail
-        
+
     def get_absolute_position(coord, bias, gran):
-        # Convert absolute position to a normalized value within the specified range
-        return (math.degrees(coord) + bias) / gran
+        return (math.degrees(coord) + bias) / gran    
 
     satDest = block.destination.linkedSat[1]
+    print(satDest)
     if satDest is None:
         print(f'{block.destination} has no linked satellite :(')
         return None
-
+    
     # Current coordinates
     current_lat = sat.latitude
     current_lon = sat.longitude
@@ -5638,50 +5403,69 @@ def getDeepStateDiff(block, sat, linkedSats):
     queuesD = getQueues(linkedSats['D'], DDQN=True)
     queuesR = getQueues(linkedSats['R'], DDQN=True)
     queuesL = getQueues(linkedSats['L'], DDQN=True)
+    
+    # Get the last satellite info (previous hop)
+    
+    # Build node features for each satellite
+    node_features = []
+    # Add features for the current satellite and its neighbors
+    for direction in ['U', 'D', 'R', 'L']:
+        # Add link scores
+        node_features.extend([
+            getDeepSatScore(queuesU[direction]),  # Use correct direction to access score
+            getDeepSatScore(queuesD[direction]),
+            getDeepSatScore(queuesR[direction]),
+            getDeepSatScore(queuesL[direction]),
+            get_relative_position(linkedSats[direction], current_lat, is_lat=True),
+            get_relative_position(linkedSats[direction], current_lon, is_lat=False)
+        ])
+    
+    # Add absolute current satellite position
+    node_features.append(get_absolute_position(current_lat, latBias, coordGran))
+    node_features.append(get_absolute_position(current_lon, lonBias, coordGran))
 
-    state = [
-        # Up link scores and positions
-        getDeepSatScore(queuesU['U']),
-        getDeepSatScore(queuesU['D']),
-        getDeepSatScore(queuesU['R']),
-        getDeepSatScore(queuesU['L']),
-        get_relative_position(linkedSats['U'], current_lat, is_lat=True),
-        get_relative_position(linkedSats['U'], current_lon, is_lat=False),
+    # Add destination relative position
+    node_features.append(get_relative_position(satDest, current_lat, is_lat=True))
+    node_features.append(get_relative_position(satDest, current_lon, is_lat=False))
 
-        # Down link scores and positions
-        getDeepSatScore(queuesD['U']),
-        getDeepSatScore(queuesD['D']),
-        getDeepSatScore(queuesD['R']),
-        getDeepSatScore(queuesD['L']),
-        get_relative_position(linkedSats['D'], current_lat, is_lat=True),
-        get_relative_position(linkedSats['D'], current_lon, is_lat=False),
+    node_features = np.array(node_features).reshape(1, -1)  # Reshaped to a 1D array
+    
+    # 检查如何构建 id_to_index 字典
+    id_to_index = {}
+    sat_idx = -1  # 设置默认值为-1，表示未初始化
+    if satDest:
+        sat_idx = id_to_index.get(satDest, -1)  # 如果找不到，则保持默认值
+    neighbor_idx = -1  # 设置默认值为-1，表示未初始化
+    if satDest:
+        neighbor_idx = id_to_index.get(satDest, -1)
+    for direction in ['U', 'D', 'R', 'L']:
+        neighbor_sat = linkedSats[direction]
+        if neighbor_sat:
+            id_to_index[sat.ID] = sat_idx
+            id_to_index[neighbor_sat.ID] = neighbor_idx
 
-        # Right link scores and positions
-        getDeepSatScore(queuesR['U']),
-        getDeepSatScore(queuesR['D']),
-        getDeepSatScore(queuesR['R']),
-        getDeepSatScore(queuesR['L']),
-        get_relative_position(linkedSats['R'], current_lat, is_lat=True),
-        get_relative_position(linkedSats['R'], current_lon, is_lat=False),
+    print(id_to_index)  # 打印 id_to_index，确保所有 ID 都已包含
 
-        # Left link scores and positions
-        getDeepSatScore(queuesL['U']),
-        getDeepSatScore(queuesL['D']),
-        getDeepSatScore(queuesL['R']),
-        getDeepSatScore(queuesL['L']),
-        get_relative_position(linkedSats['L'], current_lat, is_lat=True),
-        get_relative_position(linkedSats['L'], current_lon, is_lat=False),
+    edges = []
+    for direction in ['U', 'D', 'R', 'L']:
+        neighbor_sat = linkedSats[direction]
+        if neighbor_sat:
+            sat_idx = id_to_index.get(sat.ID, None)  # 安全地查找
+            neighbor_idx = id_to_index.get(neighbor_sat.ID, None)
+            
+            if sat_idx is None or neighbor_idx is None:
+                print(f"Warning: Missing ID mapping for {sat.ID} or {neighbor_sat.ID}")
+            else:
+                edges.append((sat_idx, neighbor_idx))
 
-        # Absolute current satellite's coordinates
-        get_absolute_position(current_lat, latBias, coordGran),
-        get_absolute_position(current_lon, lonBias, coordGran),
+    # 打印并检查 edges
+    print("Edges:", edges)
 
-        # Destination's differential coordinates
-        get_relative_position(satDest, current_lat, is_lat=True),
-        get_relative_position(satDest, current_lon, is_lat=False)
-    ]
+    # 转换为torch tensor
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
-    return np.array(state).reshape(1, -1)
+    # Return node features and edge index as the graph structure for GCN
+    return node_features, edge_index
 
 
 def getDeepState(block, sat, linkedSats):
@@ -5907,7 +5691,6 @@ def saveQTables(outputPath, earth):
 
 def saveDeepNetworks(outputPath, earth):
     print('Saving Deep Neural networks at: ' + outputPath)
-    os.makedirs(outputPath, exist_ok=True) 
     if not onlinePhase:
         earth.DDQNA.qNetwork.save(outputPath + 'qNetwork_'+ str(len(earth.gateways)) + 'GTs' + '.h5')
         if ddqn:
@@ -5997,13 +5780,12 @@ def save_plot_rewards(outputPath, reward, GTnumber, window_size=200):
     plt.xlabel("Time [ms]", fontsize=15)
     plt.ylabel("Average rewards", fontsize=15)
     plt.grid(True)
-    # plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.15)
+    plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.15)
 
     # Save plot
     rewards_dir = os.path.join(outputPath, 'Rewards')
-    plt.tight_layout()
     os.makedirs(rewards_dir, exist_ok=True)  # create output path
-    plt.savefig(os.path.join(rewards_dir, "rewards_{}_gateways.png".format(GTnumber)))#, bbox_inches='tight')
+    plt.savefig(os.path.join(rewards_dir, "rewards_{}_gateways.png".format(GTnumber)), bbox_inches='tight')
     plt.close()
 
     # Save CSV
@@ -6127,157 +5909,8 @@ def plotSavePathLatencies(outputPath, GTnumber, pathBlocks):
     # os.makedirs(outputPath + '/loss/', exist_ok=True) # create output path
 
 
-def plot_packet_latencies_and_uplink_downlink_throughput(data, outputPath, bins_num=30, save=False, plot_separately=True):
-    """
-    Generate either separate scatter plots of packet latencies for each path (source-destination),
-    or a single plot combining all paths. Overlay line plots of uplink and downlink throughput on 
-    a secondary y-axis, with a single legend for all items in the upper right.
-    """
-
-    save_dir = os.path.join(outputPath, 'Throughput')
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Group blocks by (source, destination) paths
-    paths_data = defaultdict(list)
-    for block in data:
-        src = block.path[0][0]        # Source
-        dst = block.path[-1][0]       # Destination
-        paths_data[(src, dst)].append(block)
-
-    # Function to plot data for a single path or combined
-    def plot_path_data(blocks, src=None, dst=None):
-        fig, ax1 = plt.subplots(figsize=(8, 4))
-        
-        # Sort blocks by creation time
-        blocks = sorted(blocks, key=lambda b: b.creationTime)
-        
-        # Extract times and latencies (converted to ms)
-        creation_times = np.array([block.creationTime for block in blocks]) * 1000  # ms
-        arrival_times = np.array([block.creationTime + block.totLatency for block in blocks]) * 1000  # ms
-        latencies = np.array([block.totLatency * 1000 for block in blocks])  # ms
-
-        # Scatter plot for packet arrival times vs latency
-        arrival_scatter = ax1.scatter(arrival_times, latencies, color='#1E90FF', label='Packet Delivery', alpha=0.6, s=10)
-        
-        # Configure primary y-axis for latency
-        ax1.set_xlabel('Time [ms]', fontsize=16)
-        ax1.set_ylabel('Average E2E Latency [ms]', fontsize=16)
-        
-        # Create secondary y-axis for throughput
-        ax2 = ax1.twinx()
-        time_bins = np.linspace(min(creation_times), max(arrival_times), num=bins_num)
-        
-        # Calculate throughput
-        uplink_counts, _ = np.histogram(creation_times, bins=time_bins)
-        uplink_throughput = (uplink_counts * BLOCK_SIZE / 1e3) / np.diff(time_bins)  # Mbps
-        downlink_counts, _ = np.histogram(arrival_times, bins=time_bins)
-        downlink_throughput = (downlink_counts * BLOCK_SIZE / 1e3) / np.diff(time_bins)  # Mbps
-
-        # Plot throughput on secondary y-axis
-        uplink_line, = ax2.plot(time_bins[:-1], uplink_throughput, color='#00008B', lw=2, label='Uplink Throughput')
-        downlink_line, = ax2.plot(time_bins[:-1], downlink_throughput, color='#1E90FF', lw=2, label='Downlink Throughput')
-        
-        # Configure secondary y-axis for throughput
-        ax2.set_ylabel('Throughput [Mbps]', fontsize=16)
-        
-        # Combine legends
-        handles = [arrival_scatter, uplink_line, downlink_line]
-        labels = [handle.get_label() for handle in handles]
-        ax1.legend(handles, labels, loc='upper center', fontsize=12)
-
-        # Display grid and layout adjustments
-        ax1.grid(True)
-        ax2.grid(True, linestyle=':', linewidth=0.5)
-        plt.tight_layout()
-        
-        # Save or show plot
-        if save:
-            filename = f'{src}_{dst}_path_latency_throughput.png' if src and dst else 'combined_path_latency_throughput.png'
-            plt.savefig(os.path.join(save_dir, filename), dpi=300)
-        else:
-            plt.show()
-        plt.close()
-
-    # Plot all paths together or separately based on flag
-    if plot_separately:
-        for (src, dst), blocks in paths_data.items():
-            plot_path_data(blocks, src, dst)
-    else:
-        all_blocks = [block for blocks in paths_data.values() for block in blocks]
-        plot_path_data(all_blocks)
-
-
-def plot_throughput_cdf(data, outputPath, bins_num=100, save=False, plot_separately=True):
-    """
-    Generate and save a CDF plot of the throughput. Either plot each route separately or
-    combine all routes into a single plot based on the `plot_separately` flag.
-    """
-    save_dir = os.path.join(outputPath, 'Throughput')
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Group blocks by (source, destination) paths
-    paths_data = defaultdict(list)
-    for block in data:
-        src = block.path[0][0]  # Source
-        dst = block.path[-1][0]  # Destination
-        paths_data[(src, dst)].append(block)
-
-    # Helper function to plot CDF for a given set of blocks
-    def plot_cdf_for_path(blocks, src=None, dst=None):
-        fig, ax = plt.subplots(figsize=(8, 4))
-        
-        # Sort blocks by creation time
-        blocks = sorted(blocks, key=lambda b: b.creationTime)
-        
-        # Extract creation times and arrival times
-        creation_times = np.array([block.creationTime for block in blocks])
-        arrival_times = np.array([block.creationTime + block.totLatency for block in blocks])
-        
-        # Define time bins and calculate throughput
-        time_bins = np.linspace(min(creation_times), max(arrival_times), num=bins_num)
-        uplink_counts, _ = np.histogram(creation_times, bins=time_bins)
-        uplink_throughput = (uplink_counts * BLOCK_SIZE / 1e6) / np.diff(time_bins)  # Mbps
-        downlink_counts, _ = np.histogram(arrival_times, bins=time_bins)
-        downlink_throughput = (downlink_counts * BLOCK_SIZE / 1e6) / np.diff(time_bins)  # Mbps
-        
-        # Sort and calculate CDF
-        uplink_throughput_sorted = np.sort(uplink_throughput)
-        downlink_throughput_sorted = np.sort(downlink_throughput)
-        uplink_cdf = np.arange(1, len(uplink_throughput_sorted) + 1) / len(uplink_throughput_sorted)
-        downlink_cdf = np.arange(1, len(downlink_throughput_sorted) + 1) / len(downlink_throughput_sorted)
-        
-        # Plot CDFs
-        ax.plot(uplink_throughput_sorted, uplink_cdf, label='Uplink Throughput', color='#00008B', lw=2)
-        ax.plot(downlink_throughput_sorted, downlink_cdf, label='Downlink Throughput', color='#1E90FF', lw=2)
-        
-        # Configure plot
-        ax.set_xlabel('Throughput [Mbps]', fontsize=16)
-        ax.set_ylabel('CDF', fontsize=16)
-        ax.legend(loc='lower right', fontsize=12)
-        ax.grid(True)
-        ax.tick_params(axis='both', which='major', labelsize=16)
-        
-        # Adjust layout, save plot, and close
-        plt.tight_layout()
-        if save:
-            filename = f'Throughput_CDF_{src}_to_{dst}.png' if src and dst else 'Throughput_CDF_All_Paths.png'
-            plt.savefig(os.path.join(save_dir, filename), dpi=300)
-        else:
-            plt.show()
-        plt.close()
-
-    # Plot each path separately or all paths combined based on flag
-    if plot_separately:
-        for (src, dst), blocks in paths_data.items():
-            plot_cdf_for_path(blocks, src, dst)
-    else:
-        all_blocks = [block for blocks in paths_data.values() for block in blocks]
-        plot_cdf_for_path(all_blocks)
-
-
 def plotSaveAllLatencies(outputPath, GTnumber, allLatencies, epsDF=None, annotate_min_latency=True):  
     # preprocess and setup
-    GTnumber_Max = 4 # max number of gts for displaying the legend. If the number of GTs is bigger than this, then no legend is displayed
     sns.set(font_scale=1.5)
     window_size = winSize
     marker_size = markerSize
@@ -6349,13 +5982,8 @@ def plotSaveAllLatencies(outputPath, GTnumber, allLatencies, epsDF=None, annotat
             handles, labels = axes[i, 0].get_legend_handles_labels()
             axes[i, 0].legend(handles, labels, loc='upper right')
 
-        if GTnumber > GTnumber_Max:
-            # Disable legends on both subplots
-            if axes[i, 0].get_legend():
-                axes[i, 0].get_legend().set_visible(False)
-            if axes[i, 1].get_legend():
-                axes[i, 1].get_legend().set_visible(False)
-
+        # axes[i, 0].legend().set_visible(False)  # ANCHOR latency figure legend disabled
+        # axes[i, 1].legend().set_visible(False)  # ANCHOR latency figure legend disabled
         
     # Adjust the layout
     plt.tight_layout()
@@ -6393,7 +6021,7 @@ def plotRatesFigures():
     plt.close()
 
 
-def plotCongestionMap(self, paths, outPath, GTnumber, plot_separately=True):
+def plotCongestionMap(self, paths, outPath, GTnumber):
     def extract_gateways(path):
     # Assuming QPath's first and last elements contain gateway identifiers
         if pathing == 'Q-Learning' or pathing == 'Deep Q-Learning':
@@ -6403,7 +6031,7 @@ def plotCongestionMap(self, paths, outPath, GTnumber, plot_separately=True):
         
     os.makedirs(outPath, exist_ok=True)
 
-    # Identify unique routes and filter by packet threshold (100 packets)
+    # Identify unique routes and filter by packet threshold (e.g., 500 packets)
     unique_routes = {}
     for block in paths:
         p = block.QPath if pathing == 'Q-Learning' or pathing == 'Deep Q-Learning' else block.path
@@ -6414,7 +6042,7 @@ def plotCongestionMap(self, paths, outPath, GTnumber, plot_separately=True):
             else:
                 unique_routes[gateways] = 1
 
-    filtered_routes = {route: count for route, count in unique_routes.items() if count > 100} # REVIEW Packet threshold for path visualization 500
+    filtered_routes = {route: count for route, count in unique_routes.items() if count > 500}
 
     # Plot for all routes combined
     if pathing == 'Q-Learning' or pathing == 'Deep Q-Learning':
@@ -6429,19 +6057,18 @@ def plotCongestionMap(self, paths, outPath, GTnumber, plot_separately=True):
         print('Congestion map for all routes not available')
 
     # Plot for each unique route above the threshold
-    if plot_separately:
-        for route, count in filtered_routes.items():
-            if pathing == 'Q-Learning' or pathing == 'Deep Q-Learning':
-                route_paths = [block for block in paths if extract_gateways(block) == route and block.QPath]
-            else:
-                route_paths = [block for block in paths if extract_gateways(block) == route and block.path]
+    for route, count in filtered_routes.items():
+        if pathing == 'Q-Learning' or pathing == 'Deep Q-Learning':
+            route_paths = [block for block in paths if extract_gateways(block) == route and block.QPath]
+        else:
+            route_paths = [block for block in paths if extract_gateways(block) == route and block.path]
 
-            done = self.plotMap(plotGT=True, plotSat=True, edges=False, save=True, paths=np.asarray(route_paths),
-                        fileName=os.path.join(outPath, f"CongestionMap_{route[0]}_to_{route[1]}_{GTnumber}GTs.png"))
-            plt.close()
-            if done == -1:
-                print(f'Congestion map for {route} not available')
-
+        done = self.plotMap(plotGT=True, plotSat=True, edges=False, save=True, paths=np.asarray(route_paths),
+                     fileName=os.path.join(outPath, f"CongestionMap_{route[0]}_to_{route[1]}_{GTnumber}GTs.png"))
+        plt.close()
+        if done == -1:
+            print(f'Congestion map for {route} not available')
+    
 
 # @profile
 def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
@@ -6473,8 +6100,6 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
         global Train
         global TrainThis
         global nnpath
-        if FL_Test:
-            global CKA_Values
         if ddqn:
             global nnpathTarget
         TrainThis       = Train
@@ -6518,7 +6143,7 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
         os.makedirs(islpath, exist_ok=True) 
         earth1.plotMap(plotGT = True, plotSat = True, edges=True, save = True, outputPath=islpath, n=earth1.nMovs)
         plt.close()
-        print('----------------------------------')
+        print('----------------------------')
 
         progress = env.process(simProgress(simulationTimelimit, env))
         startTime = time.time()
@@ -6533,11 +6158,6 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
             
             # save & plot ftirst 2 GTs path latencies
             plotSavePathLatencies(outputPath, GTnumber, pathBlocks)
-
-            # Throughput figures
-            print('Plotting Throughput...')
-            plot_packet_latencies_and_uplink_downlink_throughput(blocks, outputPath, bins_num=30, save = True, plot_separately = plotAllThro)
-            plot_throughput_cdf(blocks, outputPath, bins_num = 100, save = True, plot_separately = plotAllThro)
             
             if pathing == "Deep Q-Learning" or pathing == 'Q-Learning':
                 save_plot_rewards(outputPath, earth1.rewards, GTnumber)
@@ -6556,12 +6176,9 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
                 print('Plotting latencies...')
                 plotSaveAllLatencies(outputPath, GTnumber, allLatencies, epsDF)
             
-            if pathing == "Deep Q-Learning":
+            elif pathing == "Deep Q-Learning":
                 # save losses
                 save_losses(outputPath, earth1, GTnumber)
-                if FL_Test and const_moved:
-                    print('Plotting CKA values...')
-                    plot_cka_over_time(earth1.CKA, outputPath, GTnumber)
                 
             else:
                 print('Plotting latencies...')
@@ -6572,7 +6189,7 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
             plotQueues(earth1.queues, outputPath, GTnumber)
 
         print('Plotting link congestion figures...')
-        plotCongestionMap(earth1, np.asarray(blocks), outputPath + '/Congestion_Test/', GTnumber, plot_separately=plotAllCon)
+        plotCongestionMap(earth1, np.asarray(blocks), outputPath + '/Congestion_Test/', GTnumber)
 
         print(f"number of gateways: {GTnumber}")
         print('Path:')
@@ -6598,13 +6215,13 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
             np.save("{}blocks_{}".format(blockPath, GTnumber), np.asarray(blocks),allow_pickle=True)
         except pickle.PicklingError:
             print('Error with pickle and profiling')
-        '''
 
         # save learnt values
         if pathing == 'Q-Learning':
             saveQTables(outputPath, earth1)
         elif pathing == 'Deep Q-Learning':
             saveDeepNetworks(outputPath + '/NNs/', earth1)
+        '''
 
         # percentages.clear()
         receivedDataBlocks  .clear()
